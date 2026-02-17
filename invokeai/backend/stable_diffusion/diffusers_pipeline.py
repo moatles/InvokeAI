@@ -28,6 +28,12 @@ from invokeai.backend.util.attention import auto_detect_slice_size
 from invokeai.backend.util.devices import TorchDevice
 from invokeai.backend.util.hotfixes import ControlNetModel
 
+from invokeai.backend.stable_diffusion.diffusion.conditioning_data import (
+    IPAdapterData,
+    TextConditioningData,
+    ScheduledTextConditioningData,
+)
+
 
 @dataclass
 class AddsMaskGuidance:
@@ -439,7 +445,7 @@ class StableDiffusionGeneratorPipeline(StableDiffusionPipeline):
         self,
         t: torch.Tensor,
         latents: torch.Tensor,
-        conditioning_data: TextConditioningData,
+        conditioning_data: Union[TextConditioningData, ScheduledTextConditioningData],  # MODIFIED TYPE
         step_index: int,
         total_step_count: int,
         scheduler_step_kwargs: dict[str, Any],
@@ -452,6 +458,16 @@ class StableDiffusionGeneratorPipeline(StableDiffusionPipeline):
     ):
         # invokeai_diffuser has batched timesteps, but diffusers schedulers expect a single value
         timestep = t[0]
+
+        # ADDED: Handle scheduled conditioning
+        # If we have scheduled conditioning, get the appropriate one for this step (1-indexed)
+        if isinstance(conditioning_data, ScheduledTextConditioningData):
+            step_conditioning_data = conditioning_data.get_text_conditioning_for_step(step_index + 1)
+            # Move to correct device
+            step_conditioning_data.cond_text = step_conditioning_data.cond_text.to(device=latents.device, dtype=latents.dtype)
+            step_conditioning_data.uncond_text = step_conditioning_data.uncond_text.to(device=latents.device, dtype=latents.dtype)
+        else:
+            step_conditioning_data = conditioning_data
 
         # Handle masked image-to-image (a.k.a inpainting).
         if mask_guidance is not None:
@@ -472,7 +488,7 @@ class StableDiffusionGeneratorPipeline(StableDiffusionPipeline):
                 timestep=timestep,
                 step_index=step_index,
                 total_step_count=total_step_count,
-                conditioning_data=conditioning_data,
+                conditioning_data=step_conditioning_data,  # MODIFIED: use step-specific conditioning
             )
 
         # Handle T2I-Adapter(s)
@@ -550,19 +566,22 @@ class StableDiffusionGeneratorPipeline(StableDiffusionPipeline):
             timestep=t,  # TODO: debug how handled batched and non batched timesteps
             step_index=step_index,
             total_step_count=total_step_count,
-            conditioning_data=conditioning_data,
+            conditioning_data=step_conditioning_data,  # MODIFIED: use step-specific conditioning
             ip_adapter_data=ip_adapter_data,
             down_block_additional_residuals=down_block_additional_residuals,  # for ControlNet
             mid_block_additional_residual=mid_block_additional_residual,  # for ControlNet
             down_intrablock_additional_residuals=down_intrablock_additional_residuals,  # for T2I-Adapter
         )
 
-        guidance_scale = conditioning_data.guidance_scale
+        # MODIFIED: Use step_conditioning_data for guidance_scale
+        guidance_scale = step_conditioning_data.guidance_scale
         if isinstance(guidance_scale, list):
             guidance_scale = guidance_scale[step_index]
 
         noise_pred = self.invokeai_diffuser._combine(uc_noise_pred, c_noise_pred, guidance_scale)
-        guidance_rescale_multiplier = conditioning_data.guidance_rescale_multiplier
+
+        # MODIFIED: Use step_conditioning_data for rescale multiplier
+        guidance_rescale_multiplier = step_conditioning_data.guidance_rescale_multiplier
         if guidance_rescale_multiplier > 0:
             noise_pred = self._rescale_cfg(
                 noise_pred,

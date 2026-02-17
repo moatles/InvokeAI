@@ -59,6 +59,8 @@ from invokeai.backend.stable_diffusion.diffusion.conditioning_data import (
     SDXLConditioningInfo,
     TextConditioningData,
     TextConditioningRegions,
+    ScheduledTextConditioningData,
+    ConditioningFieldData,
 )
 from invokeai.backend.stable_diffusion.diffusion.custom_atttention import CustomAttnProcessor2_0
 from invokeai.backend.stable_diffusion.diffusion_backend import StableDiffusionBackend
@@ -350,7 +352,7 @@ class DenoiseLatentsInvocation(BaseInvocation):
         cfg_scale: float | list[float],
         steps: int,
         cfg_rescale_multiplier: float,
-    ) -> TextConditioningData:
+    ) -> Union[TextConditioningData, ScheduledTextConditioningData]:
         # Normalize positive_conditioning_field and negative_conditioning_field to lists.
         cond_list = positive_conditioning_field
         if not isinstance(cond_list, list):
@@ -359,12 +361,29 @@ class DenoiseLatentsInvocation(BaseInvocation):
         if not isinstance(uncond_list, list):
             uncond_list = [uncond_list]
 
-        cond_text_embeddings, cond_text_embedding_masks = DenoiseLatentsInvocation._get_text_embeddings_and_masks(
-            cond_list, context, device, dtype
-        )
-        uncond_text_embeddings, uncond_text_embedding_masks = DenoiseLatentsInvocation._get_text_embeddings_and_masks(
-            uncond_list, context, device, dtype
-        )
+        # Load ConditioningFieldData objects instead of directly getting embeddings
+        cond_field_data_list = [context.conditioning.load(cond.conditioning_name) for cond in cond_list]
+        uncond_field_data_list = [context.conditioning.load(uncond.conditioning_name) for uncond in uncond_list]
+
+        # Get masks
+        cond_text_embedding_masks = [
+            context.tensors.load(cond.mask.tensor_name) if cond.mask is not None else None
+            for cond in cond_list
+        ]
+        uncond_text_embedding_masks = [
+            context.tensors.load(uncond.mask.tensor_name) if uncond.mask is not None else None
+            for uncond in uncond_list
+        ]
+
+        # Extract the first conditioning from each FieldData and move to device
+        cond_text_embeddings = [
+            field_data.conditionings[0].to(device=device, dtype=dtype)
+            for field_data in cond_field_data_list
+        ]
+        uncond_text_embeddings = [
+            field_data.conditionings[0].to(device=device, dtype=dtype)
+            for field_data in uncond_field_data_list
+        ]
 
         cond_text_embedding, cond_regions = DenoiseLatentsInvocation._concat_regional_text_embeddings(
             text_conditionings=cond_text_embeddings,
@@ -384,14 +403,91 @@ class DenoiseLatentsInvocation(BaseInvocation):
         if isinstance(cfg_scale, list):
             assert len(cfg_scale) == steps, "cfg_scale (list) must have the same length as the number of steps"
 
-        conditioning_data = TextConditioningData(
-            uncond_text=uncond_text_embedding,
-            cond_text=cond_text_embedding,
+        # Check if any of the field data has scheduling
+        has_scheduling = any(fd.has_scheduling for fd in cond_field_data_list + uncond_field_data_list)
+
+        if not has_scheduling:
+            # No scheduling, return regular TextConditioningData
+            conditioning_data = TextConditioningData(
+                uncond_text=uncond_text_embedding,
+                cond_text=cond_text_embedding,
+                uncond_regions=uncond_regions,
+                cond_regions=cond_regions,
+                guidance_scale=cfg_scale,
+                guidance_rescale_multiplier=cfg_rescale_multiplier,
+            )
+            return conditioning_data
+
+        # Has scheduling - we need to handle this differently
+        from invokeai.backend.stable_diffusion.diffusion.conditioning_data import (
+            ConditioningFieldData,
+            ScheduledTextConditioningData,
+        )
+
+        # Create new ConditioningFieldData with the concatenated embeddings
+        # preserving the end_at_step from the original field data
+        if len(cond_field_data_list) == 1 and cond_text_embedding_masks[0] is None:
+            # Simple case: single prompt, no regional masking
+            # Use the original field data directly
+            final_cond_field_data = cond_field_data_list[0]
+        else:
+            # Complex case: multiple prompts or regional masking
+            # We need to create new field data with concatenated embeddings
+            # but preserve scheduling from the first prompt
+            if isinstance(cond_text_embedding, SDXLConditioningInfo):
+                conditionings = [
+                    SDXLConditioningInfo(
+                        embeds=cond_text_embedding.embeds.to(device=device, dtype=dtype),
+                        pooled_embeds=cond_text_embedding.pooled_embeds.to(device=device, dtype=dtype),
+                        add_time_ids=cond_text_embedding.add_time_ids.to(device=device),
+                        end_at_step=cond.end_at_step if hasattr(cond, 'end_at_step') else None
+                    )
+                    for cond in cond_field_data_list[0].conditionings
+                ]
+            else:
+                conditionings = [
+                    BasicConditioningInfo(
+                        embeds=cond_text_embedding.embeds.to(device=device, dtype=dtype),
+                        end_at_step=cond.end_at_step if hasattr(cond, 'end_at_step') else None
+                    )
+                    for cond in cond_field_data_list[0].conditionings
+                ]
+            final_cond_field_data = ConditioningFieldData(conditionings=conditionings)
+
+        if len(uncond_field_data_list) == 1 and uncond_text_embedding_masks[0] is None:
+            # Simple case: single prompt, no regional masking
+            final_uncond_field_data = uncond_field_data_list[0]
+        else:
+            # Complex case: multiple prompts or regional masking
+            if isinstance(uncond_text_embedding, SDXLConditioningInfo):
+                conditionings = [
+                    SDXLConditioningInfo(
+                        embeds=uncond_text_embedding.embeds.to(device=device, dtype=dtype),
+                        pooled_embeds=uncond_text_embedding.pooled_embeds.to(device=device, dtype=dtype),
+                        add_time_ids=uncond_text_embedding.add_time_ids.to(device=device),
+                        end_at_step=uncond.end_at_step if hasattr(uncond, 'end_at_step') else None
+                    )
+                    for uncond in uncond_field_data_list[0].conditionings
+                ]
+            else:
+                conditionings = [
+                    BasicConditioningInfo(
+                        embeds=uncond_text_embedding.embeds.to(device=device, dtype=dtype),
+                        end_at_step=uncond.end_at_step if hasattr(uncond, 'end_at_step') else None
+                    )
+                    for uncond in uncond_field_data_list[0].conditionings
+                ]
+            final_uncond_field_data = ConditioningFieldData(conditionings=conditionings)
+
+        conditioning_data = ScheduledTextConditioningData(
+            uncond_field_data=final_uncond_field_data,
+            cond_field_data=final_cond_field_data,
             uncond_regions=uncond_regions,
             cond_regions=cond_regions,
             guidance_scale=cfg_scale,
             guidance_rescale_multiplier=cfg_rescale_multiplier,
         )
+
         return conditioning_data
 
     @staticmethod
@@ -839,18 +935,18 @@ class DenoiseLatentsInvocation(BaseInvocation):
         unet_config = context.models.get_config(self.unet.unet.key)
 
         conditioning_data = self.get_conditioning_data(
-            context=context,
-            positive_conditioning_field=self.positive_conditioning,
-            negative_conditioning_field=self.negative_conditioning,
-            cfg_scale=self.cfg_scale,
-            steps=self.steps,
-            latent_height=latent_height,
-            latent_width=latent_width,
-            device=device,
-            dtype=dtype,
-            # TODO: old backend, remove
-            cfg_rescale_multiplier=self.cfg_rescale_multiplier,
+        context=context,
+        positive_conditioning_field=self.positive_conditioning,
+        negative_conditioning_field=self.negative_conditioning,
+        cfg_scale=self.cfg_scale,
+        steps=self.steps,
+        latent_height=latent_height,
+        latent_width=latent_width,
+        device=device,
+        dtype=dtype,
+        cfg_rescale_multiplier=self.cfg_rescale_multiplier,
         )
+        # conditioning_data is now Union[TextConditioningData, ScheduledTextConditioningData]
 
         scheduler = get_scheduler(
             context=context,

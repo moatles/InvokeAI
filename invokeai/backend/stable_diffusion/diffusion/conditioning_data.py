@@ -19,6 +19,7 @@ class BasicConditioningInfo:
     """SD 1/2 text conditioning information produced by Compel."""
 
     embeds: torch.Tensor
+    end_at_step: Optional[int] = None  # For A1111-style prompt scheduling
 
     def to(self, device, dtype=None):
         self.embeds = self.embeds.to(device=device, dtype=dtype)
@@ -29,8 +30,9 @@ class BasicConditioningInfo:
 class SDXLConditioningInfo(BasicConditioningInfo):
     """SDXL text conditioning information produced by Compel."""
 
-    pooled_embeds: torch.Tensor
-    add_time_ids: torch.Tensor
+    pooled_embeds: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    add_time_ids: torch.Tensor = field(default_factory=lambda: torch.empty(0))
+    # end_at_step inherited from BasicConditioningInfo
 
     def to(self, device, dtype=None):
         self.pooled_embeds = self.pooled_embeds.to(device=device, dtype=dtype)
@@ -42,6 +44,7 @@ class SDXLConditioningInfo(BasicConditioningInfo):
 class FLUXConditioningInfo:
     clip_embeds: torch.Tensor
     t5_embeds: torch.Tensor
+    end_at_step: Optional[int] = None  # For A1111-style prompt scheduling
 
     def to(self, device: torch.device | None = None, dtype: torch.dtype | None = None):
         self.clip_embeds = self.clip_embeds.to(device=device, dtype=dtype)
@@ -56,6 +59,7 @@ class SD3ConditioningInfo:
     clip_g_pooled_embeds: torch.Tensor
     clip_g_embeds: torch.Tensor
     t5_embeds: torch.Tensor | None
+    end_at_step: Optional[int] = None  # For A1111-style prompt scheduling
 
     def to(self, device: torch.device | None = None, dtype: torch.dtype | None = None):
         self.clip_l_pooled_embeds = self.clip_l_pooled_embeds.to(device=device, dtype=dtype)
@@ -70,6 +74,7 @@ class SD3ConditioningInfo:
 @dataclass
 class CogView4ConditioningInfo:
     glm_embeds: torch.Tensor
+    end_at_step: Optional[int] = None  # For A1111-style prompt scheduling
 
     def to(self, device: torch.device | None = None, dtype: torch.dtype | None = None):
         self.glm_embeds = self.glm_embeds.to(device=device, dtype=dtype)
@@ -82,10 +87,22 @@ class ZImageConditioningInfo:
 
     prompt_embeds: torch.Tensor
     """Text embeddings from Qwen3 encoder. Shape: (batch_size, seq_len, hidden_size)."""
+    end_at_step: Optional[int] = None  # For A1111-style prompt scheduling
 
     def to(self, device: torch.device | None = None, dtype: torch.dtype | None = None):
         self.prompt_embeds = self.prompt_embeds.to(device=device, dtype=dtype)
         return self
+
+
+# Type alias for all conditioning info types
+ConditioningInfo = Union[
+    BasicConditioningInfo,
+    SDXLConditioningInfo,
+    FLUXConditioningInfo,
+    SD3ConditioningInfo,
+    CogView4ConditioningInfo,
+    ZImageConditioningInfo,
+]
 
 
 @dataclass
@@ -101,6 +118,33 @@ class ConditioningFieldData:
         | List[CogView4ConditioningInfo]
         | List[ZImageConditioningInfo]
     )
+
+    def get_conditioning_for_step(self, step: int) -> ConditioningInfo:
+        """
+        Get the appropriate conditioning for a given denoising step.
+        Supports A1111-style prompt scheduling where different prompts
+        can be active at different steps.
+
+        Args:
+            step: Current step (1-indexed)
+
+        Returns:
+            The conditioning info to use for this step
+        """
+        if len(self.conditionings) == 1:
+            return self.conditionings[0]
+
+        for cond in self.conditionings:
+            if cond.end_at_step is not None and step <= cond.end_at_step:
+                return cond
+
+        # Return the last one if no match
+        return self.conditionings[-1]
+
+    @property
+    def has_scheduling(self) -> bool:
+        """Returns True if this conditioning has multiple scheduled prompts."""
+        return len(self.conditionings) > 1
 
 
 @dataclass
@@ -182,6 +226,8 @@ class ConditioningMode(Enum):
     Positive = "positive"
 
 
+# Add to the existing TextConditioningData class in conditioning_data.py
+
 class TextConditioningData:
     def __init__(
         self,
@@ -190,25 +236,83 @@ class TextConditioningData:
         uncond_regions: Optional[TextConditioningRegions],
         cond_regions: Optional[TextConditioningRegions],
         guidance_scale: Union[float, List[float]],
-        guidance_rescale_multiplier: float = 0,  # TODO: old backend, remove
+        guidance_rescale_multiplier: float = 0,
     ):
         self.uncond_text = uncond_text
         self.cond_text = cond_text
         self.uncond_regions = uncond_regions
         self.cond_regions = cond_regions
-        # Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
-        # `guidance_scale` is defined as `w` of equation 2. of [Imagen Paper](https://arxiv.org/pdf/2205.11487.pdf).
-        # Guidance scale is enabled by setting `guidance_scale > 1`. Higher guidance scale encourages to generate
-        # images that are closely linked to the text `prompt`, usually at the expense of lower image quality.
         self.guidance_scale = guidance_scale
-        # TODO: old backend, remove
-        # For models trained using zero-terminal SNR ("ztsnr"), it's suggested to use guidance_rescale_multiplier of 0.7.
-        # See [Common Diffusion Noise Schedules and Sample Steps are Flawed](https://arxiv.org/pdf/2305.08891.pdf).
         self.guidance_rescale_multiplier = guidance_rescale_multiplier
 
     def is_sdxl(self):
         assert isinstance(self.uncond_text, SDXLConditioningInfo) == isinstance(self.cond_text, SDXLConditioningInfo)
         return isinstance(self.cond_text, SDXLConditioningInfo)
+
+    @staticmethod
+    def from_field_data(
+        uncond_field_data: ConditioningFieldData,
+        cond_field_data: ConditioningFieldData,
+        uncond_regions: Optional[TextConditioningRegions],
+        cond_regions: Optional[TextConditioningRegions],
+        guidance_scale: Union[float, List[float]],
+        guidance_rescale_multiplier: float = 0,
+        current_step: Optional[int] = None,
+    ) -> Union["TextConditioningData", "ScheduledTextConditioningData"]:
+        """
+        Create a TextConditioningData from ConditioningFieldData objects.
+
+        If the field data contains scheduled prompts, returns a ScheduledTextConditioningData.
+        Otherwise returns a regular TextConditioningData.
+
+        Args:
+            uncond_field_data: Unconditional conditioning field data
+            cond_field_data: Conditional conditioning field data
+            uncond_regions: Unconditional regional prompting data
+            cond_regions: Conditional regional prompting data
+            guidance_scale: CFG guidance scale
+            guidance_rescale_multiplier: Rescale multiplier for CFG
+            current_step: If provided and scheduling is present, returns conditioning for this specific step
+
+        Returns:
+            TextConditioningData or ScheduledTextConditioningData
+        """
+        # Check if either conditioning has scheduling
+        has_scheduling = uncond_field_data.has_scheduling or cond_field_data.has_scheduling
+
+        if not has_scheduling:
+            # No scheduling, return simple TextConditioningData
+            return TextConditioningData(
+                uncond_text=uncond_field_data.conditionings[0],
+                cond_text=cond_field_data.conditionings[0],
+                uncond_regions=uncond_regions,
+                cond_regions=cond_regions,
+                guidance_scale=guidance_scale,
+                guidance_rescale_multiplier=guidance_rescale_multiplier,
+            )
+
+        if current_step is not None:
+            # Scheduling is present but we want a specific step
+            return TextConditioningData(
+                uncond_text=uncond_field_data.get_conditioning_for_step(current_step),
+                cond_text=cond_field_data.get_conditioning_for_step(current_step),
+                uncond_regions=uncond_regions,
+                cond_regions=cond_regions,
+                guidance_scale=guidance_scale,
+                guidance_rescale_multiplier=guidance_rescale_multiplier,
+            )
+
+        # Scheduling is present and no specific step requested, return scheduled version
+        return ScheduledTextConditioningData(
+            uncond_field_data=uncond_field_data,
+            cond_field_data=cond_field_data,
+            uncond_regions=uncond_regions,
+            cond_regions=cond_regions,
+            guidance_scale=guidance_scale,
+            guidance_rescale_multiplier=guidance_rescale_multiplier,
+        )
+
+    # ... rest of existing methods ...
 
     def to_unet_kwargs(self, unet_kwargs: UNetKwargs, conditioning_mode: ConditioningMode):
         """Fills unet arguments with data from provided conditionings.
@@ -320,3 +424,52 @@ class TextConditioningData:
             encoder_attention_mask = torch.cat(encoder_attention_masks)
 
         return torch.cat(conditionings), encoder_attention_mask
+
+
+class ScheduledTextConditioningData:
+    """
+    Text conditioning data that supports A1111-style prompt scheduling.
+    Wraps multiple TextConditioningData objects, one for each schedule step.
+    """
+
+    def __init__(
+        self,
+        uncond_field_data: ConditioningFieldData,
+        cond_field_data: ConditioningFieldData,
+        uncond_regions: Optional[TextConditioningRegions],
+        cond_regions: Optional[TextConditioningRegions],
+        guidance_scale: Union[float, List[float]],
+        guidance_rescale_multiplier: float = 0,
+    ):
+        self.uncond_field_data = uncond_field_data
+        self.cond_field_data = cond_field_data
+        self.uncond_regions = uncond_regions
+        self.cond_regions = cond_regions
+        self.guidance_scale = guidance_scale
+        self.guidance_rescale_multiplier = guidance_rescale_multiplier
+
+    def get_text_conditioning_for_step(self, step: int) -> TextConditioningData:
+        """
+        Get the TextConditioningData for a specific denoising step.
+
+        Args:
+            step: Current step (1-indexed)
+
+        Returns:
+            TextConditioningData configured for this step
+        """
+        uncond = self.uncond_field_data.get_conditioning_for_step(step)
+        cond = self.cond_field_data.get_conditioning_for_step(step)
+
+        return TextConditioningData(
+            uncond_text=uncond,
+            cond_text=cond,
+            uncond_regions=self.uncond_regions,
+            cond_regions=self.cond_regions,
+            guidance_scale=self.guidance_scale,
+            guidance_rescale_multiplier=self.guidance_rescale_multiplier,
+        )
+
+    @property
+    def has_scheduling(self) -> bool:
+        return self.uncond_field_data.has_scheduling or self.cond_field_data.has_scheduling
